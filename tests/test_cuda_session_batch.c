@@ -179,6 +179,11 @@ int main(void) {
         .cuda_tensor_parallel = multi_gpu,
         .share_session_prefill_workspace = true,
         .placement_ctx_hint = (uint32_t)test_ctx,
+        /* Reserve VRAM for every resident session before the model cache
+         * claims the remainder — the same hint ds4-server passes.  Without
+         * it a single-GPU run caches the whole model and session creation
+         * fails with out-of-memory. */
+        .placement_session_count_hint = session_count + 1,
     };
     const char *comp_cache = getenv("DS4_TEST_COMP_CACHE");
     if (comp_cache && comp_cache[0] &&
