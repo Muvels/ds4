@@ -11755,9 +11755,13 @@ decode_again:
                 finish = "stop";
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
-                pthread_mutex_lock(&s->inference_mu);
-                ds4_session_invalidate(slot->session);
-                pthread_mutex_unlock(&s->inference_mu);
+                /* Fair engine turn, not a bare lock: another slot may be
+                 * mid-prefill and its quantum loop would otherwise starve
+                 * this acquisition, delaying response delivery. */
+                if (server_prefill_enter(s, slot)) {
+                    ds4_session_invalidate(slot->session);
+                    server_prefill_leave(s);
+                }
                 stop_decode = true;
                 break;
             }
