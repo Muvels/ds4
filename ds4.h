@@ -22,6 +22,20 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+/* Storage format for DeepSeek's long-lived attention-compressor cache.
+ * FP8 retains the historical float-simulated cache representation.  TURBO3
+ * is an experimental CUDA-only packed 3-bit representation derived from
+ * PR #243; it trades some model quality and decode speed for substantially
+ * lower long-context memory use. */
+typedef enum {
+    DS4_COMP_CACHE_FP8 = 0,
+    DS4_COMP_CACHE_TURBO3,
+} ds4_comp_cache_dtype;
+
+const char *ds4_comp_cache_dtype_name(ds4_comp_cache_dtype dtype);
+bool ds4_comp_cache_dtype_from_name(const char *name,
+                                    ds4_comp_cache_dtype *out);
+
 typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
@@ -156,6 +170,7 @@ typedef struct {
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     bool inspect_only;
+    ds4_comp_cache_dtype comp_cache_dtype;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;
     /* Number of independently allocated session graphs/caches to reserve. */

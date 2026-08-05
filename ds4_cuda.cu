@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
@@ -6999,6 +7000,216 @@ __global__ static void fp8_kv_quantize_store_rows_kernel(
         raw[(uint64_t)dsc.raw_start * head_dim + d] =
             __half2float(__float2half(xr[d]));
     }
+}
+
+/* Experimental TurboQuant+ compressor-cache codec, adapted from PR #243.
+ * A 512-wide row is stored as 192 bytes of 3-bit indices plus eight E4M3
+ * scales.  Each group is randomized-Hadamard transformed before Lloyd-Max
+ * quantization and restored to the original basis when read. */
+#define DS4_TURBO3_GROUP_SIZE 64u
+#define DS4_TURBO3_DATA_BYTES_PER_GROUP 24u
+
+__device__ __constant__ float DS4_TURBO3_CODEBOOK_D[8] = {
+    -2.1520f, -1.3440f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3440f,  2.1520f
+};
+__device__ __constant__ float DS4_TURBO3_BOUNDS_D[7] = {
+    -1.748f, -1.050f, -0.501f, 0.0f, 0.501f, 1.050f, 1.748f
+};
+__device__ __constant__ float DS4_TURBO_SIGNS1_64_D[64] = {
+    +1,-1,-1,-1,+1,+1,+1,-1,-1,-1,-1,+1,-1,-1,+1,+1,
+    -1,+1,+1,-1,+1,+1,-1,-1,+1,-1,-1,-1,+1,+1,+1,+1,
+    +1,+1,-1,+1,+1,+1,+1,+1,+1,-1,-1,-1,-1,-1,-1,-1,
+    +1,-1,-1,-1,-1,+1,+1,+1,-1,+1,-1,-1,+1,+1,+1,+1
+};
+__device__ __constant__ float DS4_TURBO_SIGNS2_64_D[64] = {
+    +1,+1,-1,-1,-1,+1,-1,-1,-1,+1,+1,+1,-1,-1,-1,-1,
+    -1,+1,-1,+1,+1,-1,-1,+1,-1,-1,+1,-1,+1,+1,+1,-1,
+    -1,-1,-1,-1,-1,-1,+1,-1,-1,-1,-1,-1,+1,-1,-1,-1,
+    +1,+1,+1,+1,-1,+1,-1,-1,-1,+1,-1,+1,+1,-1,-1,+1
+};
+
+__device__ __forceinline__ unsigned int ds4_turbo3_quant_idx(float x) {
+    unsigned int idx;
+    if (x >= DS4_TURBO3_BOUNDS_D[3]) {
+        idx = 4;
+        if (x >= DS4_TURBO3_BOUNDS_D[5]) {
+            idx = x >= DS4_TURBO3_BOUNDS_D[6] ? 7u : 6u;
+        } else if (x >= DS4_TURBO3_BOUNDS_D[4]) {
+            idx = 5;
+        }
+    } else {
+        idx = 0;
+        if (x >= DS4_TURBO3_BOUNDS_D[1]) {
+            idx = x >= DS4_TURBO3_BOUNDS_D[2] ? 3u : 2u;
+        } else if (x >= DS4_TURBO3_BOUNDS_D[0]) {
+            idx = 1;
+        }
+    }
+    return idx;
+}
+
+__device__ __forceinline__ void ds4_turbo3_wht64(float *buf) {
+    #pragma unroll
+    for (uint32_t stride = 1; stride < 64; stride <<= 1) {
+        #pragma unroll
+        for (uint32_t base = 0; base < 64; base += 2u * stride) {
+            #pragma unroll
+            for (uint32_t i = 0; i < stride; i++) {
+                const float a = buf[base + i];
+                const float b = buf[base + stride + i];
+                buf[base + i] = a + b;
+                buf[base + stride + i] = a - b;
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void ds4_turbo3_pack_group(
+        unsigned char *data_out,
+        unsigned char *scale_out,
+        const float   *rotated) {
+    float amax = 0.0f;
+    float norm_sq = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        const float v = rotated[i];
+        amax = fmaxf(amax, fabsf(v));
+        norm_sq += v * v;
+    }
+    const float k_inv = amax > 1e-12f ? 2.1520f / amax : 1.0f;
+    unsigned int idx[64];
+    float recon_sq = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        idx[i] = ds4_turbo3_quant_idx(rotated[i] * k_inv);
+        const float c = DS4_TURBO3_CODEBOOK_D[idx[i]];
+        recon_sq += c * c;
+    }
+    const float recon_norm = sqrtf(recon_sq);
+    float scale = recon_norm > 1e-10f
+        ? sqrtf(norm_sq) / recon_norm : amax / 2.1520f;
+    scale = fminf(448.0f, fmaxf(0.0f, scale));
+    const __nv_fp8_storage_t packed_scale = __nv_cvt_float_to_fp8(
+        scale, __NV_SATFINITE, __NV_E4M3);
+    *scale_out = (unsigned char)packed_scale;
+
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; chunk++) {
+        const unsigned int *p = &idx[chunk * 8];
+        unsigned char *b = &data_out[chunk * 3];
+        b[0] = (unsigned char)(p[0] | (p[1] << 3) |
+                               ((p[2] & 0x3u) << 6));
+        b[1] = (unsigned char)((p[2] >> 2) | (p[3] << 1) |
+                               (p[4] << 4) | ((p[5] & 0x1u) << 7));
+        b[2] = (unsigned char)((p[5] >> 1) | (p[6] << 2) |
+                               (p[7] << 5));
+    }
+}
+
+__device__ __forceinline__ void ds4_turbo3_dequant_group(
+        float               *out,
+        const unsigned char *row,
+        uint32_t             group,
+        uint32_t             n_values,
+        int                  signs_on) {
+    const unsigned char *data =
+        row + (uint64_t)group * DS4_TURBO3_DATA_BYTES_PER_GROUP;
+    const uint64_t data_bytes = (uint64_t)n_values * 3u / 8u;
+    const unsigned char scale_byte = row[data_bytes + group];
+    const float scale = __half2float(
+        __nv_cvt_fp8_to_halfraw(scale_byte, __NV_E4M3));
+    float scaled[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        scaled[i] = DS4_TURBO3_CODEBOOK_D[i] * scale;
+    }
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; chunk++) {
+        const unsigned char *b = data + chunk * 3;
+        float *o = out + chunk * 8;
+        const unsigned int b0 = b[0];
+        const unsigned int b1 = b[1];
+        const unsigned int b2 = b[2];
+        o[0] = scaled[b0 & 7u];
+        o[1] = scaled[(b0 >> 3) & 7u];
+        o[2] = scaled[((b0 >> 6) | (b1 << 2)) & 7u];
+        o[3] = scaled[(b1 >> 1) & 7u];
+        o[4] = scaled[(b1 >> 4) & 7u];
+        o[5] = scaled[((b1 >> 7) | (b2 << 1)) & 7u];
+        o[6] = scaled[(b2 >> 2) & 7u];
+        o[7] = scaled[(b2 >> 5) & 7u];
+    }
+    if (signs_on) {
+        #pragma unroll
+        for (int i = 0; i < 64; i++) out[i] *= DS4_TURBO_SIGNS2_64_D[i];
+    }
+    ds4_turbo3_wht64(out);
+    #pragma unroll
+    for (int i = 0; i < 64; i++) out[i] *= 0.125f;
+    if (signs_on) {
+        #pragma unroll
+        for (int i = 0; i < 64; i++) out[i] *= DS4_TURBO_SIGNS1_64_D[i];
+    }
+}
+
+__global__ static void ds4_turbo3_comp_pack_kernel(
+        const float   *src,
+        unsigned char *dst,
+        uint32_t       n_rows,
+        uint32_t       head_dim,
+        uint64_t       row_bytes,
+        int            signs_on) {
+    const uint32_t row_idx = blockIdx.x;
+    const uint32_t group = threadIdx.x;
+    if (row_idx >= n_rows || group >= head_dim / DS4_TURBO3_GROUP_SIZE) {
+        return;
+    }
+    const float *src_group = src + (uint64_t)row_idx * head_dim +
+                             (uint64_t)group * DS4_TURBO3_GROUP_SIZE;
+    float values[64];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        values[i] = signs_on ? src_group[i] * DS4_TURBO_SIGNS1_64_D[i]
+                             : src_group[i];
+    }
+    ds4_turbo3_wht64(values);
+    #pragma unroll
+    for (int i = 0; i < 64; i++) values[i] *= 0.125f;
+    if (signs_on) {
+        #pragma unroll
+        for (int i = 0; i < 64; i++) values[i] *= DS4_TURBO_SIGNS2_64_D[i];
+    }
+    unsigned char *dst_row = dst + (uint64_t)row_idx * row_bytes;
+    const uint64_t data_bytes = (uint64_t)head_dim * 3u / 8u;
+    ds4_turbo3_pack_group(
+        dst_row + (uint64_t)group * DS4_TURBO3_DATA_BYTES_PER_GROUP,
+        dst_row + data_bytes + group,
+        values);
+}
+
+__global__ static void ds4_turbo3_comp_dequant_kernel(
+        const unsigned char *src,
+        float               *dst,
+        uint32_t             n_rows,
+        uint32_t             head_dim,
+        uint64_t             row_bytes,
+        int                  signs_on) {
+    const uint32_t row_idx = blockIdx.x;
+    const uint32_t group = threadIdx.x;
+    if (row_idx >= n_rows || group >= head_dim / DS4_TURBO3_GROUP_SIZE) {
+        return;
+    }
+    float values[64];
+    ds4_turbo3_dequant_group(values,
+                             src + (uint64_t)row_idx * row_bytes,
+                             group,
+                             head_dim,
+                             signs_on);
+    float *dst_group = dst + (uint64_t)row_idx * head_dim +
+                       (uint64_t)group * DS4_TURBO3_GROUP_SIZE;
+    #pragma unroll
+    for (int i = 0; i < 64; i++) dst_group[i] = values[i];
 }
 
 __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
@@ -16302,6 +16513,68 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
     fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
+}
+
+static int ds4_turbo3_signs_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("DS4_TURBO_NO_SIGNS");
+        cached = value && value[0] &&
+                 !(value[0] == '0' && value[1] == '\0') ? 0 : 1;
+    }
+    return cached;
+}
+
+extern "C" int ds4_gpu_dsv4_turbo3_comp_pack_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint64_t              dst_first_row,
+        uint32_t              head_dim,
+        uint64_t              dst_row_bytes) {
+    if (!src || !dst || head_dim == 0 ||
+        head_dim % DS4_TURBO3_GROUP_SIZE != 0) return 0;
+    if (n_rows == 0) return 1;
+    const uint64_t expected = (uint64_t)head_dim * 3u / 8u +
+                              head_dim / DS4_TURBO3_GROUP_SIZE;
+    if (dst_row_bytes != expected ||
+        src->bytes < (uint64_t)n_rows * head_dim * sizeof(float) ||
+        dst_first_row > UINT64_MAX - n_rows ||
+        dst->bytes < (dst_first_row + n_rows) * dst_row_bytes) return 0;
+    ds4_turbo3_comp_pack_kernel<<<n_rows, 64>>>(
+        (const float *)src->ptr,
+        (unsigned char *)dst->ptr + dst_first_row * dst_row_bytes,
+        n_rows,
+        head_dim,
+        dst_row_bytes,
+        ds4_turbo3_signs_enabled());
+    return cuda_ok(cudaGetLastError(), "turbo3 comp pack launch");
+}
+
+extern "C" int ds4_gpu_dsv4_turbo3_comp_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint64_t              src_first_row,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint64_t              src_row_bytes) {
+    if (!src || !dst || head_dim == 0 ||
+        head_dim % DS4_TURBO3_GROUP_SIZE != 0) return 0;
+    if (n_rows == 0) return 1;
+    const uint64_t expected = (uint64_t)head_dim * 3u / 8u +
+                              head_dim / DS4_TURBO3_GROUP_SIZE;
+    if (src_row_bytes != expected ||
+        src_first_row > UINT64_MAX - n_rows ||
+        src->bytes < (src_first_row + n_rows) * src_row_bytes ||
+        dst->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) return 0;
+    ds4_turbo3_comp_dequant_kernel<<<n_rows, 64>>>(
+        (const unsigned char *)src->ptr + src_first_row * src_row_bytes,
+        (float *)dst->ptr,
+        n_rows,
+        head_dim,
+        src_row_bytes,
+        ds4_turbo3_signs_enabled());
+    return cuda_ok(cudaGetLastError(), "turbo3 comp dequant launch");
 }
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||

@@ -1915,6 +1915,16 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
+        } else if (!strcmp(arg, "--comp-cache")) {
+            const char *name = need_arg(&i, argc, argv, arg);
+            if (!ds4_comp_cache_dtype_from_name(name,
+                                                &c.engine.comp_cache_dtype)) {
+                fprintf(stderr,
+                        "ds4: unknown --comp-cache value '%s' "
+                        "(expected fp8 or turbo3)\n",
+                        name);
+                exit(1);
+            }
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {

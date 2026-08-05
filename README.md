@@ -284,6 +284,27 @@ session creation, `DS4_CUDA_FORCE_MANAGED_KV=1` forces only the KV allocation
 into CUDA managed memory. This is useful for long-context experiments and may
 reduce decode throughput when the KV pages are not resident.
 
+This fork also carries an experimental backport of the compressor-cache
+TurboQuant+ format from [PR #243](https://github.com/antirez/ds4/pull/243).
+`--comp-cache turbo3` packs each 512-value attention-compressor row into 200
+bytes instead of CUDA's normal 2048-byte float-simulated row. The indexer cache
+and short raw KV ring are unchanged. The current backport dequantizes through a
+per-session scratch buffer before attention, so it prioritizes memory savings
+over prefill/decode speed and must be quality-tested for the intended workload.
+
+The experiment currently supports one CUDA GPU, does not support distributed
+execution or disk KV snapshots, and disables the coalesced multi-session
+attention kernel while preserving resident session scheduling. Defaults are
+unchanged unless the flag is present. Example:
+
+```sh
+DS4_CUDA_Q8_F16_CACHE_MB=0 \
+DS4_CUDA_FORCE_MANAGED_KV=1 \
+./ds4-server --cuda --gpu-vram auto --gpu-devices 0 \
+  --model ./ds4flash.gguf --ctx 131072 --prefill-chunk 256 \
+  --batched-session 2 --comp-cache turbo3 --host 0.0.0.0
+```
+
 Streaming is not as fast as fitting the full model in RAM. It still needs memory
 for non-routed weights, KV cache, graph scratch, activations, and the routed
 expert cache. It is useful because routed experts dominate model size and modern

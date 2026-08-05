@@ -104,6 +104,33 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
     return n;
 }
 
+/* The engine is process-exclusive (ds4_acquire_instance_lock), so one active
+ * cache format is sufficient for memory estimation and graph allocation.
+ * Keep FP8 as zero/default so every existing caller remains unchanged. */
+static ds4_comp_cache_dtype g_ds4_comp_cache_dtype = DS4_COMP_CACHE_FP8;
+
+const char *ds4_comp_cache_dtype_name(ds4_comp_cache_dtype dtype) {
+    switch (dtype) {
+    case DS4_COMP_CACHE_FP8: return "fp8";
+    case DS4_COMP_CACHE_TURBO3: return "turbo3";
+    default: return "unknown";
+    }
+}
+
+bool ds4_comp_cache_dtype_from_name(const char *name,
+                                    ds4_comp_cache_dtype *out) {
+    if (!name || !out) return false;
+    if (strcmp(name, "fp8") == 0) {
+        *out = DS4_COMP_CACHE_FP8;
+        return true;
+    }
+    if (strcmp(name, "turbo3") == 0) {
+        *out = DS4_COMP_CACHE_TURBO3;
+        return true;
+    }
+    return false;
+}
+
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
@@ -14955,6 +14982,16 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 #define DS4_GPU_ATTN_COMP_CACHE_F16 0
 #endif
 
+static uint64_t ds4_comp_cache_row_bytes(void) {
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
+        /* 512 3-bit values plus one FP8 scale per group of 64. */
+        return ((uint64_t)DS4_N_HEAD_DIM * 3u) / 8u +
+               (uint64_t)DS4_N_HEAD_DIM / 64u;
+    }
+    return (uint64_t)DS4_N_HEAD_DIM *
+           (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+}
+
 #define DS4_GPU_GLM_COMPACT_CACHE_F16 DS4_GPU_ATTN_COMP_CACHE_F16
 
 /* =========================================================================
@@ -15007,6 +15044,7 @@ typedef struct {
      * the row counters whenever a checkpoint is saved or partially rewound. */
     ds4_gpu_tensor *layer_raw_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_comp_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_attn_comp_cache_packed[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
@@ -15050,6 +15088,7 @@ typedef struct {
     ds4_gpu_tensor *comp_kv_cur_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *comp_sc_cur_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *attn_comp_stage_by_tier[DS4_MAX_GPUS];
+    ds4_gpu_tensor *comp_cache_dequant_scratch_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *indexer_q_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *indexer_weights_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *indexer_scores_by_tier[DS4_MAX_GPUS];
@@ -15792,6 +15831,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->comp_sc_cur_by_tier[t]);
         ds4_gpu_tensor_free(g->comp_kv_cur_by_tier[t]);
         ds4_gpu_tensor_free(g->attn_comp_stage_by_tier[t]);
+        ds4_gpu_tensor_free(g->comp_cache_dequant_scratch_by_tier[t]);
         ds4_gpu_tensor_free(g->comp_mask_by_tier[t]);
         ds4_gpu_tensor_free(g->comp_selected_by_tier[t]);
         ds4_gpu_tensor_free(g->indexer_scores_by_tier[t]);
@@ -15806,6 +15846,9 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_attn_comp_cache_packed[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_comp_cache_tp[il]);
@@ -16110,8 +16153,7 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
-        bytes += comp_cap * DS4_N_HEAD_DIM *
-                 (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+        bytes += comp_cap * ds4_comp_cache_row_bytes();
         if (ratio == 4) {
             bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         }
@@ -16136,10 +16178,14 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
                      2ull * comp_cap * prefill_cap * sizeof(float);
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+        g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
         uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
         bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
+    }
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
+        bytes += comp_cap * DS4_N_HEAD_DIM * sizeof(float);
     }
     return bytes;
 }
@@ -16955,7 +17001,8 @@ static bool metal_graph_alloc_raw_cap(
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
     g->comp_cap = ctx_size / min_ratio + 2u;
     if (g->comp_cap < 2u) g->comp_cap = 2u;
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+        g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
@@ -17100,12 +17147,23 @@ static bool metal_graph_alloc_raw_cap(
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
-            g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
-                    managed_kv_cache,
-                    layer_tier,
-                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
-                    (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
-            if (layer_tp_partner >= 0) {
+            if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
+                g->layer_attn_comp_cache_packed[il] =
+                    metal_graph_alloc_kv_cache_tensor_on(
+                        managed_kv_cache,
+                        layer_tier,
+                        (uint64_t)g->layer_comp_cap[il] *
+                            ds4_comp_cache_row_bytes());
+            } else {
+                g->layer_attn_comp_cache[il] =
+                    metal_graph_alloc_kv_cache_tensor_on(
+                        managed_kv_cache,
+                        layer_tier,
+                        (uint64_t)g->layer_comp_cap[il] *
+                            ds4_comp_cache_row_bytes());
+            }
+            if (layer_tp_partner >= 0 &&
+                g_ds4_comp_cache_dtype != DS4_COMP_CACHE_TURBO3) {
                 g->layer_attn_comp_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
                         layer_tp_partner,
@@ -17186,11 +17244,18 @@ static bool metal_graph_alloc_raw_cap(
         if (!used_tier[t]) continue;
         g->comp_kv_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_width_max * sizeof(float));
         g->comp_sc_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_width_max * sizeof(float));
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+            g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
             /* Upstream's F16-compressed attn staging buffer. Only allocated when
              * the F16-cache mode is enabled (the non-F16 path stages in-place). */
             g->attn_comp_stage_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
                     (uint64_t)g->attn_comp_stage_cap * DS4_N_HEAD_DIM * sizeof(float));
+        }
+        if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
+            g->comp_cache_dequant_scratch_by_tier[t] =
+                ds4_gpu_tensor_alloc_ptr_on(
+                    t,
+                    (uint64_t)g->comp_cap * DS4_N_HEAD_DIM * sizeof(float));
         }
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
@@ -17390,7 +17455,11 @@ static bool metal_graph_alloc_raw_cap(
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
-            layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
+            const bool attn_cache_ok =
+                g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3
+                    ? g->layer_attn_comp_cache_packed[il] != NULL
+                    : g->layer_attn_comp_cache[il] != NULL;
+            layer_cache_ok = attn_cache_ok &&
                              (!g->cuda_tp_attn_cache_dup ||
                               g->layer_attn_comp_cache_tp[il] != NULL) &&
                              g->layer_attn_state_kv[il] != NULL &&
@@ -17425,7 +17494,11 @@ static bool metal_graph_alloc_raw_cap(
             g->attn_cur_by_tier[t] && g->attn_norm_by_tier[t] && g->qr_by_tier[t] && g->qr_norm_by_tier[t] &&
             g->q_by_tier[t] && g->kv_raw_by_tier[t] && g->kv_by_tier[t] &&
             g->comp_kv_cur_by_tier[t] && g->comp_sc_cur_by_tier[t] &&
-            (!DS4_GPU_ATTN_COMP_CACHE_F16 || g->attn_comp_stage_by_tier[t]) &&
+            (!(DS4_GPU_ATTN_COMP_CACHE_F16 ||
+               g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) ||
+             g->attn_comp_stage_by_tier[t]) &&
+            (g_ds4_comp_cache_dtype != DS4_COMP_CACHE_TURBO3 ||
+             g->comp_cache_dequant_scratch_by_tier[t]) &&
             g->indexer_q_by_tier[t] && g->indexer_weights_by_tier[t] && g->indexer_scores_by_tier[t] &&
             g->comp_mask_by_tier[t] && g->comp_selected_by_tier[t] &&
             g->heads_by_tier[t] && g->attn_low_by_tier[t] && g->attn_out_by_tier[t] &&
@@ -19966,12 +20039,12 @@ static bool metal_graph_decode_kv_store(
 }
 
 static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
-    return (uint64_t)DS4_N_HEAD_DIM *
-           (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+    return ds4_comp_cache_row_bytes();
 }
 
 static uint32_t metal_graph_attn_comp_cache_is_f16(void) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
+    return DS4_GPU_ATTN_COMP_CACHE_F16 &&
+           g_ds4_comp_cache_dtype != DS4_COMP_CACHE_TURBO3 ? 1u : 0u;
 }
 
 static bool metal_graph_store_attn_comp_stage(
@@ -19981,10 +20054,26 @@ static bool metal_graph_store_attn_comp_stage(
         uint32_t       rows) {
     if (!g || il >= DS4_N_LAYER) return false;
     if (rows == 0) return true;
-    if (!g->layer_attn_comp_cache[il] || !metal_graph_attn_comp_stage(g)) return false;
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
+        if (!g->layer_attn_comp_cache_packed[il] ||
+            !metal_graph_attn_comp_stage(g)) return false;
+    } else if (!g->layer_attn_comp_cache[il] ||
+               !metal_graph_attn_comp_stage(g)) {
+        return false;
+    }
     if (rows > g->attn_comp_stage_cap || first_row > g->layer_comp_cap[il] ||
         rows > g->layer_comp_cap[il] - first_row) {
         return false;
+    }
+
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
+        return ds4_gpu_dsv4_turbo3_comp_pack_tensor(
+                    metal_graph_attn_comp_stage(g),
+                    g->layer_attn_comp_cache_packed[il],
+                    rows,
+                    first_row,
+                    DS4_N_HEAD_DIM,
+                    ds4_comp_cache_row_bytes()) != 0;
     }
 
     const uint64_t count = (uint64_t)rows * DS4_N_HEAD_DIM;
@@ -20008,13 +20097,15 @@ static bool metal_graph_store_attn_comp_stage(
 static ds4_gpu_tensor *metal_graph_attn_comp_update_target(
         ds4_gpu_graph *g,
         uint32_t       il) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16
+    return (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+            g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3)
         ? metal_graph_attn_comp_stage(g)
         : g->layer_attn_comp_cache[il];
 }
 
 static uint32_t metal_graph_attn_comp_update_row(uint32_t row) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16 ? 0u : row;
+    return (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+            g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) ? 0u : row;
 }
 
 static bool metal_graph_commit_attn_comp_stage(
@@ -20022,7 +20113,8 @@ static bool metal_graph_commit_attn_comp_stage(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (!DS4_GPU_ATTN_COMP_CACHE_F16) return true;
+    if (!DS4_GPU_ATTN_COMP_CACHE_F16 &&
+        g_ds4_comp_cache_dtype != DS4_COMP_CACHE_TURBO3) return true;
     return metal_graph_store_attn_comp_stage(g, il, first_row, rows);
 }
 
@@ -20030,7 +20122,8 @@ static ds4_gpu_tensor *metal_graph_attn_comp_row_view(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       row) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+        g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
         return ds4_gpu_tensor_view(metal_graph_attn_comp_stage(g),
                                    0,
                                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
@@ -20045,7 +20138,10 @@ static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) return metal_graph_attn_comp_stage(g);
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+        g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
+        return metal_graph_attn_comp_stage(g);
+    }
     const uint32_t view_rows = rows ? rows : 1u;
     return ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
                                (uint64_t)first_row * DS4_N_HEAD_DIM * sizeof(float),
@@ -20053,7 +20149,41 @@ static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
 }
 
 static void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
-    if (!DS4_GPU_ATTN_COMP_CACHE_F16) ds4_gpu_tensor_free(t);
+    if (!DS4_GPU_ATTN_COMP_CACHE_F16 &&
+        g_ds4_comp_cache_dtype != DS4_COMP_CACHE_TURBO3) {
+        ds4_gpu_tensor_free(t);
+    }
+}
+
+/* Materialize the packed compressor cache into one per-session scratch tensor
+ * before an existing attention path consumes it.  This deliberately keeps
+ * the first backport small and auditable; a later CUDA-only optimization can
+ * inline dequantization in attention without changing the packed format. */
+static ds4_gpu_tensor *metal_graph_attn_comp_cache_for_read(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       n_comp) {
+    if (!g || il >= DS4_N_LAYER) return NULL;
+    if (g_ds4_comp_cache_dtype != DS4_COMP_CACHE_TURBO3) {
+        return g->layer_attn_comp_cache[il];
+    }
+    const int tier = g->active_tier >= 0 ? g->active_tier : 0;
+    if (tier >= DS4_MAX_GPUS || !g->layer_attn_comp_cache_packed[il] ||
+        !g->comp_cache_dequant_scratch_by_tier[tier]) {
+        return NULL;
+    }
+    ds4_gpu_tensor *scratch = g->comp_cache_dequant_scratch_by_tier[tier];
+    if (n_comp != 0 &&
+        !ds4_gpu_dsv4_turbo3_comp_dequant_to_scratch_tensor(
+            g->layer_attn_comp_cache_packed[il],
+            scratch,
+            0,
+            n_comp,
+            DS4_N_HEAD_DIM,
+            ds4_comp_cache_row_bytes())) {
+        return NULL;
+    }
+    return scratch;
 }
 
 static bool metal_graph_cuda_tp_attn_cache_dup_layer_ready(
@@ -22572,7 +22702,8 @@ static bool metal_graph_encode_decode_layer_phase(
         }
 
         n_comp = g->layer_n_comp[il];
-        comp_cache = g->layer_attn_comp_cache[il];
+        comp_cache = metal_graph_attn_comp_cache_for_read(g, il, n_comp);
+        if (n_comp != 0 && !comp_cache) ok = false;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
 
@@ -22705,7 +22836,7 @@ static bool metal_graph_encode_decode_layer_phase(
                         layer->attn_sinks->abs_offset,
                         metal_graph_q(g),
                         raw_cache,
-                        g->layer_attn_comp_cache[il],
+                        comp_cache,
                         metal_graph_attn_comp_cache_is_f16(),
                         comp_selected,
                         1,
@@ -22762,7 +22893,7 @@ static bool metal_graph_encode_decode_layer_phase(
                     layer->attn_sinks->abs_offset + (uint64_t)tp_head0 * (layer->attn_sinks->bytes / DS4_N_HEAD),
                     metal_graph_q(g),
                     raw_cache,
-                    g->layer_attn_comp_cache[il],
+                    comp_cache,
                     metal_graph_attn_comp_cache_is_f16(),
                     comp_selected,
                     1,
@@ -27280,6 +27411,7 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
             metal_graph_batch_after_attn_hc(g), 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+    ds4_gpu_tensor *attn_comp_cache = NULL;
     const bool fuse_hc_norm = n_tokens > 1 &&
                               DS4_N_HC == 4 &&
                               !metal_graph_use_reference_hc_decode() &&
@@ -27746,7 +27878,9 @@ static bool metal_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: Metal layer-major compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && n_comp > g->attn_comp_stage_cap) {
+            if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+                       g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) &&
+                n_comp > g->attn_comp_stage_cap) {
                 fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                 ok = false;
             }
@@ -27841,7 +27975,9 @@ static bool metal_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && comp_chunk > g->attn_comp_stage_cap) {
+                if (ok && (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+                           g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) &&
+                    comp_chunk > g->attn_comp_stage_cap) {
                     fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
@@ -28307,6 +28443,12 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         if (ratio == 4) DS4_METAL_PROFILE_ATTN_STAGE("indexer_setup");
 
+        if (ok && n_comp != 0) {
+            attn_comp_cache =
+                metal_graph_attn_comp_cache_for_read(g, il, n_comp);
+            if (!attn_comp_cache) ok = false;
+        }
+
         if (ok && !zero_prefix && n_tokens <= g->raw_cap) {
             const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, n_tokens);
             /* See the raw-only branch above: batched mixed attention also
@@ -28395,7 +28537,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               layer->attn_sinks->abs_offset,
                                                                               metal_graph_batch_q(g),
                                                                               g->layer_raw_cache[il],
-                                                                              g->layer_attn_comp_cache[il],
+                                                                              attn_comp_cache,
                                                                               metal_graph_attn_comp_cache_is_f16(),
                                                                               metal_graph_comp_selected(g),
                                                                               n_tokens,
@@ -28424,7 +28566,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              layer->attn_sinks->abs_offset,
                                                                              metal_graph_batch_q(g),
                                                                              g->layer_raw_cache[il],
-                                                                             g->layer_attn_comp_cache[il],
+                                                                             attn_comp_cache,
                                                                              metal_graph_attn_comp_cache_is_f16(),
                                                                              use_comp_mask ? metal_graph_comp_mask(g) : NULL,
                                                                              use_comp_mask,
@@ -28517,7 +28659,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           layer->attn_sinks->abs_offset,
                                                                           tp_q,
                                                                           g->layer_raw_cache[il],
-                                                                          g->layer_attn_comp_cache[il],
+                                                                          attn_comp_cache,
                                                                           metal_graph_attn_comp_cache_is_f16(),
                                                                           tp_topk,
                                                                           tp_rows,
@@ -28547,7 +28689,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           layer->attn_sinks->abs_offset,
                                                                           metal_graph_batch_q(g),
                                                                           g->layer_raw_cache[il],
-                                                                          g->layer_attn_comp_cache[il],
+                                                                          attn_comp_cache,
                                                                           metal_graph_attn_comp_cache_is_f16(),
                                                                           metal_graph_comp_selected(g),
                                                                           n_tokens,
@@ -28580,7 +28722,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                                  layer->attn_sinks->abs_offset,
                                                                                  tp_q,
                                                                                  metal_graph_batch_kv(g),
-                                                                                 g->layer_attn_comp_cache[il],
+                                                                                 attn_comp_cache,
                                                                                  metal_graph_attn_comp_cache_is_f16(),
                                                                                  tp_row0,
                                                                                  tp_rows,
@@ -28597,7 +28739,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                            layer->attn_sinks->abs_offset,
                                                                            metal_graph_batch_q(g),
                                                                            metal_graph_batch_kv(g),
-                                                                           g->layer_attn_comp_cache[il],
+                                                                           attn_comp_cache,
                                                                            metal_graph_attn_comp_cache_is_f16(),
                                                                            n_tokens,
                                                                            n_comp,
@@ -28710,7 +28852,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               layer->attn_sinks->abs_offset,
                                                                               q_view,
                                                                               g->layer_raw_cache[il],
-                                                                              g->layer_attn_comp_cache[il],
+                                                                              attn_comp_cache,
                                                                               metal_graph_attn_comp_cache_is_f16(),
                                                                               metal_graph_comp_selected(g),
                                                                               1,
@@ -28734,7 +28876,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  n_raw,
                                                                  g->raw_cap,
                                                                  raw_start,
-                                                                 cur_comp ? g->layer_attn_comp_cache[il] : NULL,
+                                                                 cur_comp ? attn_comp_cache : NULL,
                                                                  metal_graph_attn_comp_cache_is_f16(),
                                                                  cur_comp,
                                                                  comp_mask,
@@ -35503,8 +35645,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
             if (ratio == 0) continue;
             const uint32_t layer_comp_cap = ctx / ratio + 2u;
             m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                  DS4_N_HEAD_DIM *
-                                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+                                  ds4_comp_cache_row_bytes();
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
@@ -35518,6 +35659,10 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
                           m.prefill_cap *
                           sizeof(float) +
                           attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
+        if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
+            m.scratch_bytes += (uint64_t)m.comp_cap *
+                               DS4_N_HEAD_DIM * sizeof(float);
+        }
     } else {
         m.raw_cap = ds4_default_raw_cap(ctx);
         m.raw_bytes = (uint64_t)DS4_N_LAYER *
@@ -35919,6 +36064,7 @@ struct ds4_engine {
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
     ds4_backend backend;
+    ds4_comp_cache_dtype comp_cache_dtype;
     ds4_support_kind support_kind;
     int dspark_exec_tier;
     uint32_t support_stages;
@@ -49227,6 +49373,12 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         payload_set_err(err, errlen, "invalid session layer payload save");
         return 1;
     }
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3 &&
+        !ds4_session_is_glm(s)) {
+        payload_set_err(err, errlen,
+                        "turbo3 compressor cache does not yet support layer snapshots");
+        return 1;
+    }
     if (ds4_session_is_cpu(s)) {
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
         return 1;
@@ -49462,6 +49614,12 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
+        return 1;
+    }
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3 &&
+        !ds4_session_is_glm(s)) {
+        payload_set_err(err, errlen,
+                        "turbo3 compressor cache does not yet support layer restores");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
@@ -50214,6 +50372,12 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3 &&
+        !ds4_session_is_glm(s)) {
+        payload_set_err(err, errlen,
+                        "turbo3 compressor cache does not yet support snapshots");
+        return 1;
+    }
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
@@ -50521,6 +50685,12 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
+        return 1;
+    }
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3 &&
+        !ds4_session_is_glm(s)) {
+        payload_set_err(err, errlen,
+                        "turbo3 compressor cache does not yet support restores");
         return 1;
     }
     if (s->distributed) {
@@ -56104,6 +56274,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->model.fd = -1;
     e->mtp_model.fd = -1;
     e->backend = opt->backend;
+    e->comp_cache_dtype = opt->comp_cache_dtype;
+    g_ds4_comp_cache_dtype = opt->comp_cache_dtype;
     e->quality = opt->quality;
     e->glm_mtp = opt->glm_mtp;
     e->glm_mtp_timing = opt->glm_mtp_timing;
@@ -56119,6 +56291,37 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->prefill_chunk =
         ds4_effective_prefill_chunk(opt->cuda_tensor_parallel,
                                     opt->prefill_chunk);
+    if (e->comp_cache_dtype == DS4_COMP_CACHE_TURBO3) {
+#if defined(DS4_ROCM_BUILD)
+        fprintf(stderr,
+                "ds4: --comp-cache turbo3 is currently available only in the CUDA build\n");
+        free(e);
+        *out = NULL;
+        return 1;
+#else
+        if (opt->backend != DS4_BACKEND_CUDA) {
+            fprintf(stderr,
+                    "ds4: --comp-cache turbo3 requires the CUDA backend\n");
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        if (opt->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus > 1)) {
+            fprintf(stderr,
+                    "ds4: --comp-cache turbo3 currently supports one CUDA GPU only\n");
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr,
+                    "ds4: --comp-cache turbo3 does not yet support distributed sessions\n");
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+#endif
+    }
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
     e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
@@ -62119,7 +62322,8 @@ static bool metal_graph_session_batch_attn_core_supported(
     (void)weights;
     return false;
 #else
-    if (!items || count < 3 || !weights ||
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3 ||
+        !items || count < 3 || !weights ||
         count > (int)DS4_GPU_ATTENTION_DECODE_BATCH_MAX ||
         DS4_N_HEAD_DIM != 512u || metal_graph_attn_comp_cache_is_f16() ||
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
@@ -62828,6 +63032,10 @@ static bool metal_graph_encode_attention_session_batch(
     (void)row_base;
     return false;
 #else
+    /* The current coalesced-session kernel accepts only float/F16 compressor
+     * cache pointers.  Keep scheduling correct by falling back to the ordinary
+     * per-session decode path until a packed-row descriptor ABI is added. */
+    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) return false;
     if (!items || count < 2 || !model || !layer || il >= DS4_N_LAYER ||
         count > (int)DS4_GPU_ATTENTION_DECODE_BATCH_MAX) {
         return false;

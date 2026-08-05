@@ -12943,6 +12943,16 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
+        } else if (!strcmp(arg, "--comp-cache")) {
+            const char *name = need_arg(&i, argc, argv, arg);
+            if (!ds4_comp_cache_dtype_from_name(name,
+                                                &c.engine.comp_cache_dtype)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: unknown --comp-cache value '%s' "
+                           "(expected fp8 or turbo3)",
+                           name);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
@@ -12993,6 +13003,12 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    if (c.engine.comp_cache_dtype == DS4_COMP_CACHE_TURBO3 &&
+        c.kv_disk_dir) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --comp-cache turbo3 cannot currently be combined with --kv-disk-dir");
+        exit(2);
     }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
