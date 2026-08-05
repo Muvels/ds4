@@ -8143,7 +8143,8 @@ __global__ static void attention_decode_score_split_scores_tile512_rows_kernel(
         uint32_t n_rows,
         uint32_t score_stride,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        int comp_signs) {
     const uint32_t row = blockIdx.z;
     if (row >= n_rows) return;
     const ds4_gpu_attention_decode_row dsc = rows.row[row];
@@ -8151,6 +8152,9 @@ __global__ static void attention_decode_score_split_scores_tile512_rows_kernel(
 
     const float *raw_kv = (const float *)(uintptr_t)dsc.raw_kv;
     const float *comp_kv = (const float *)(uintptr_t)dsc.comp_kv;
+    const unsigned char *comp_packed =
+        (const unsigned char *)(uintptr_t)dsc.comp_kv;
+    const bool comp_turbo3 = dsc.comp_fmt == DS4_GPU_COMP_CACHE_FMT_TURBO3;
     const bool single_all = dsc.ratio == 0u;
     const uint32_t qpos = dsc.pos;
     const uint32_t first_raw_pos = dsc.pos + 1u - dsc.n_raw;
@@ -8213,6 +8217,23 @@ __global__ static void attention_decode_score_split_scores_tile512_rows_kernel(
         for (uint32_t r = rr0; r < DS4_SCORE_TILE_ROWS; r += rows_per_pass) {
             const uint32_t g = g_base + r;
             if (g >= n_score) continue;
+            if (g >= raw_count && comp_turbo3) {
+                /* Packed compressor row: staging threads 0..7 of this row
+                 * each dequantize one 64-value group straight into the same
+                 * sh_kv slots the float path fills, so scoring below is
+                 * unchanged and bit-identical to a pre-dequantized cache. */
+                if (dd < head_dim / DS4_TURBO3_GROUP_SIZE) {
+                    ds4_turbo3_dequant_group(
+                        sh_kv + r * DS4_SCORE_TILE_STRIDE +
+                            dd * DS4_TURBO3_GROUP_SIZE,
+                        comp_packed +
+                            (uint64_t)(g - raw_count) * dsc.comp_row_bytes,
+                        dd,
+                        head_dim,
+                        comp_signs);
+                }
+                continue;
+            }
             const float4 *src;
             if (g < raw_count) {
                 const uint32_t raw_row =
@@ -8606,6 +8627,11 @@ __global__ static void attention_decode_score_split_finalize_kernel(
     }
 }
 
+/* Staged packed-row chunk for the finalize/indexed decode value passes:
+ * small enough to keep total static shared memory under the 48 KB limit
+ * next to the 32 KB score buffer. */
+#define DS4_TURBO3_FINALIZE_STAGE_ROWS 4u
+
 __global__ static void attention_decode_score_split_finalize_rows_kernel(
         float *heads,
         const float *sinks,
@@ -8614,7 +8640,8 @@ __global__ static void attention_decode_score_split_finalize_rows_kernel(
         uint32_t n_rows,
         uint32_t score_stride,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        int comp_signs) {
     const uint32_t row = blockIdx.x;
     const uint32_t h = blockIdx.y;
     if (row >= n_rows || h >= n_head) return;
@@ -8622,6 +8649,9 @@ __global__ static void attention_decode_score_split_finalize_rows_kernel(
     if (dsc.indexed) return;
     const float *raw_kv = (const float *)(uintptr_t)dsc.raw_kv;
     const float *comp_kv = (const float *)(uintptr_t)dsc.comp_kv;
+    const unsigned char *comp_packed =
+        (const unsigned char *)(uintptr_t)dsc.comp_kv;
+    const bool comp_turbo3 = dsc.comp_fmt == DS4_GPU_COMP_CACHE_FMT_TURBO3;
     const bool single_all = dsc.ratio == 0u;
     const uint32_t qpos = dsc.pos;
     const uint32_t first_raw_pos = dsc.pos + 1u - dsc.n_raw;
@@ -8633,6 +8663,7 @@ __global__ static void attention_decode_score_split_finalize_rows_kernel(
     __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
     __shared__ float partial[256];
+    __shared__ float comp_stage[DS4_TURBO3_FINALIZE_STAGE_ROWS * 512u];
     __shared__ float max_s;
     __shared__ float denom;
     __shared__ uint32_t raw_count_s;
@@ -8726,9 +8757,44 @@ __global__ static void attention_decode_score_split_finalize_rows_kernel(
             const float *kv = raw_kv + (uint64_t)raw_rows[r] * head_dim;
             acc += kv[dim] * scores[r];
         }
-        for (uint32_t c = 0; c < visible_comp; c++) {
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            acc += kv[dim] * scores[raw_count + c];
+        if (comp_turbo3) {
+            /* Cooperatively dequantize packed rows into shared chunks and
+             * accumulate them in the same ascending row order as the float
+             * branch, so the reduction stays bit-identical to a
+             * pre-dequantized cache. Chunk bounds are block-uniform, which
+             * keeps the __syncthreads() barriers safe. */
+            for (uint32_t c0 = 0; c0 < visible_comp;
+                 c0 += DS4_TURBO3_FINALIZE_STAGE_ROWS) {
+                const uint32_t chunk =
+                    visible_comp - c0 < DS4_TURBO3_FINALIZE_STAGE_ROWS
+                        ? visible_comp - c0
+                        : DS4_TURBO3_FINALIZE_STAGE_ROWS;
+                const uint32_t groups = head_dim / DS4_TURBO3_GROUP_SIZE;
+                __syncthreads();
+                for (uint32_t t = threadIdx.x;
+                     t < chunk * groups;
+                     t += blockDim.x) {
+                    const uint32_t r = t / groups;
+                    const uint32_t grp = t % groups;
+                    ds4_turbo3_dequant_group(
+                        comp_stage + r * head_dim +
+                            grp * DS4_TURBO3_GROUP_SIZE,
+                        comp_packed + (uint64_t)(c0 + r) * dsc.comp_row_bytes,
+                        grp,
+                        head_dim,
+                        comp_signs);
+                }
+                __syncthreads();
+                for (uint32_t r = 0; r < chunk; r++) {
+                    acc += comp_stage[r * head_dim + dim] *
+                           scores[raw_count + c0 + r];
+                }
+            }
+        } else {
+            for (uint32_t c = 0; c < visible_comp; c++) {
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                acc += kv[dim] * scores[raw_count + c];
+            }
         }
         oh[dim] = acc / denom;
     } else {
@@ -9820,6 +9886,10 @@ __global__ static void attention_indexed_mixed_kernel(
     }
 }
 
+/* Packed-row staging chunk for the indexed rows kernel. 16 rows keep the
+ * kernel's static shared memory around 40 KB, under the 48 KB limit. */
+#define DS4_TURBO3_INDEXED_STAGE_ROWS 16u
+
 __global__ static void attention_indexed_mixed_decode_rows_kernel(
         float *heads,
         const float *sinks,
@@ -9827,7 +9897,8 @@ __global__ static void attention_indexed_mixed_decode_rows_kernel(
         cuda_attention_decode_row_table rows,
         uint32_t n_rows,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        int comp_signs) {
     const uint32_t row = blockIdx.x;
     const uint32_t h = blockIdx.y;
     if (row >= n_rows || h >= n_head) return;
@@ -9835,6 +9906,9 @@ __global__ static void attention_indexed_mixed_decode_rows_kernel(
     if (!dsc.indexed) return;
     const float *raw_kv = (const float *)(uintptr_t)dsc.raw_kv;
     const float *comp_kv = (const float *)(uintptr_t)dsc.comp_kv;
+    const unsigned char *comp_packed =
+        (const unsigned char *)(uintptr_t)dsc.comp_kv;
+    const bool comp_turbo3 = dsc.comp_fmt == DS4_GPU_COMP_CACHE_FMT_TURBO3;
     const int32_t *topk = (const int32_t *)(uintptr_t)dsc.topk;
     const uint32_t qpos = dsc.pos;
     const uint32_t first_raw_pos = dsc.pos + 1u - dsc.n_raw;
@@ -9848,6 +9922,7 @@ __global__ static void attention_indexed_mixed_decode_rows_kernel(
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t comp_rows[512];
     __shared__ float partial[256];
+    __shared__ float comp_stage[DS4_TURBO3_INDEXED_STAGE_ROWS * 512u];
     __shared__ float max_s;
     __shared__ float denom;
     __shared__ uint32_t raw_count;
@@ -9894,6 +9969,70 @@ __global__ static void attention_indexed_mixed_decode_rows_kernel(
             }
             scores[r] = dot * scale;
             local_max = fmaxf(local_max, scores[r]);
+        }
+    } else if (comp_turbo3) {
+        /* Same 8-lane scoring split as the float branch below, but the
+         * selected packed rows are first dequantized into shared chunks.
+         * Chunk bounds come from block-uniform shared values, so the
+         * barriers inside the loop are safe. */
+        const uint32_t qlane = threadIdx.x & 7u;
+        const uint32_t qgroup = threadIdx.x >> 3u;
+        const uint32_t groups = head_dim / DS4_TURBO3_GROUP_SIZE;
+        for (uint32_t row0 = 0; row0 < raw_count; row0 += 32u) {
+            const uint32_t score_row = row0 + qgroup;
+            if (score_row < raw_count) {
+                const float *kvrow =
+                    raw_kv + (uint64_t)raw_rows[score_row] * head_dim;
+                float dot = 0.0f;
+                for (uint32_t dim = qlane; dim < head_dim; dim += 8u) {
+                    dot += qh[dim] * kvrow[dim];
+                }
+                const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+                for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+                    dot += __shfl_down_sync(mask, dot, off, 8);
+                }
+                if (qlane == 0u) scores[score_row] = dot * scale;
+            }
+        }
+        for (uint32_t c0 = 0; c0 < comp_count;
+             c0 += DS4_TURBO3_INDEXED_STAGE_ROWS) {
+            const uint32_t chunk =
+                comp_count - c0 < DS4_TURBO3_INDEXED_STAGE_ROWS
+                    ? comp_count - c0
+                    : DS4_TURBO3_INDEXED_STAGE_ROWS;
+            __syncthreads();
+            for (uint32_t t = threadIdx.x;
+                 t < chunk * groups;
+                 t += blockDim.x) {
+                const uint32_t r = t / groups;
+                const uint32_t grp = t % groups;
+                ds4_turbo3_dequant_group(
+                    comp_stage + r * head_dim + grp * DS4_TURBO3_GROUP_SIZE,
+                    comp_packed +
+                        (uint64_t)comp_rows[c0 + r] * dsc.comp_row_bytes,
+                    grp,
+                    head_dim,
+                    comp_signs);
+            }
+            __syncthreads();
+            if (qgroup < chunk) {
+                const float *kvrow = comp_stage + qgroup * head_dim;
+                float dot = 0.0f;
+                for (uint32_t dim = qlane; dim < head_dim; dim += 8u) {
+                    dot += qh[dim] * kvrow[dim];
+                }
+                const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+                for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+                    dot += __shfl_down_sync(mask, dot, off, 8);
+                }
+                if (qlane == 0u) {
+                    scores[raw_count + c0 + qgroup] = dot * scale;
+                }
+            }
+        }
+        __syncthreads();
+        for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+            local_max = fmaxf(local_max, scores[i]);
         }
     } else {
         const uint32_t qlane = threadIdx.x & 7u;
@@ -9965,11 +10104,46 @@ __global__ static void attention_indexed_mixed_decode_rows_kernel(
             acc0 += kv[d0] * s;
             acc1 += kv[d1] * s;
         }
-        for (uint32_t c = 0; c < comp_count; c++) {
-            const float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+        if (comp_turbo3) {
+            /* Chunked packed-row accumulation in the same ascending order
+             * as the float branch; chunk bounds are block-uniform so the
+             * barriers are safe. */
+            const uint32_t groups = head_dim / DS4_TURBO3_GROUP_SIZE;
+            for (uint32_t c0 = 0; c0 < comp_count;
+                 c0 += DS4_TURBO3_INDEXED_STAGE_ROWS) {
+                const uint32_t chunk =
+                    comp_count - c0 < DS4_TURBO3_INDEXED_STAGE_ROWS
+                        ? comp_count - c0
+                        : DS4_TURBO3_INDEXED_STAGE_ROWS;
+                __syncthreads();
+                for (uint32_t t = threadIdx.x;
+                     t < chunk * groups;
+                     t += blockDim.x) {
+                    const uint32_t r = t / groups;
+                    const uint32_t grp = t % groups;
+                    ds4_turbo3_dequant_group(
+                        comp_stage + r * head_dim +
+                            grp * DS4_TURBO3_GROUP_SIZE,
+                        comp_packed +
+                            (uint64_t)comp_rows[c0 + r] * dsc.comp_row_bytes,
+                        grp,
+                        head_dim,
+                        comp_signs);
+                }
+                __syncthreads();
+                for (uint32_t r = 0; r < chunk; r++) {
+                    const float s = scores[raw_count + c0 + r];
+                    acc0 += comp_stage[r * head_dim + d0] * s;
+                    acc1 += comp_stage[r * head_dim + d1] * s;
+                }
+            }
+        } else {
+            for (uint32_t c = 0; c < comp_count; c++) {
+                const float s = scores[raw_count + c];
+                const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
+                acc0 += kv[d0] * s;
+                acc1 += kv[d1] * s;
+            }
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -17510,10 +17684,22 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
     uint32_t max_dense_score = 0u;
     bool have_dense = false;
     bool have_indexed = false;
+    const uint64_t turbo3_row_bytes =
+        (uint64_t)head_dim * 3u / 8u + head_dim / DS4_TURBO3_GROUP_SIZE;
     for (uint32_t i = 0; i < n_rows; i++) {
         const ds4_gpu_attention_decode_row r = rows[i];
         if (r.raw_kv == 0u || r.n_raw == 0u || r.raw_cap < r.n_raw ||
             r.raw_start >= r.raw_cap || (r.n_comp != 0u && r.comp_kv == 0u)) {
+            return 0;
+        }
+        if (r.comp_fmt == DS4_GPU_COMP_CACHE_FMT_TURBO3) {
+            /* Packed rows require the exact TurboQuant+ row geometry; the
+             * kernels stage them through shared memory before use. */
+            if (r.n_comp == 0u || r.comp_row_bytes != turbo3_row_bytes ||
+                head_dim % DS4_TURBO3_GROUP_SIZE != 0u) {
+                return 0;
+            }
+        } else if (r.comp_fmt != DS4_GPU_COMP_CACHE_FMT_F32) {
             return 0;
         }
         if (r.indexed) {
@@ -17524,6 +17710,12 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
             have_indexed = true;
         } else {
             const uint32_t raw_count = r.n_raw > 256u ? 256u : r.n_raw;
+            /* Reject oversized n_comp before the addition so a malformed
+             * descriptor cannot wrap n_score around 2^32 and slip past the
+             * score-cap check below. */
+            if (r.n_comp > DS4_CUDA_ATTENTION_SCORE_CAP) {
+                return 0;
+            }
             const uint32_t n_score = raw_count + r.n_comp;
             /* n_score==1 takes the legacy one-block kernel and is not a
              * score-split shape. Decode after any nonempty prompt is >1. */
@@ -17540,6 +17732,8 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
         logical_tier, "attn_sinks_rows");
     if (!sinks) return 0;
+
+    const int comp_signs = ds4_turbo3_signs_enabled();
 
     if (have_dense) {
         if ((uint64_t)n_rows > UINT64_MAX / n_head ||
@@ -17581,7 +17775,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         attention_decode_score_split_scores_tile512_rows_kernel
             <<<score_grid, 256, tile_shmem>>>(
                 scores, (const float *)q->ptr, table, n_rows,
-                max_dense_score, n_head, head_dim);
+                max_dense_score, n_head, head_dim, comp_signs);
         if (!cuda_ok(cudaGetLastError(),
                      "attention exact score rows launch")) {
             return 0;
@@ -17590,7 +17784,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         attention_decode_score_split_finalize_rows_kernel
             <<<final_grid, 512>>>(
                 (float *)heads->ptr, sinks, scores, table, n_rows,
-                max_dense_score, n_head, head_dim);
+                max_dense_score, n_head, head_dim, comp_signs);
         if (!cuda_ok(cudaGetLastError(),
                      "attention exact finalize rows launch")) {
             return 0;
@@ -17600,7 +17794,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         dim3 indexed_grid(n_rows, n_head, 1u);
         attention_indexed_mixed_decode_rows_kernel<<<indexed_grid, 256>>>(
             (float *)heads->ptr, sinks, (const float *)q->ptr, table,
-            n_rows, n_head, head_dim);
+            n_rows, n_head, head_dim, comp_signs);
         if (!cuda_ok(cudaGetLastError(),
                      "attention indexed decode rows launch")) {
             return 0;

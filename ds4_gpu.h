@@ -25,6 +25,9 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 #ifndef DS4_GPU_ATTENTION_DECODE_ROW_DEFINED
 #define DS4_GPU_ATTENTION_DECODE_ROW_DEFINED
 #define DS4_GPU_ATTENTION_DECODE_BATCH_MAX 32u
+/* comp_fmt values: how a row's comp_kv pointer must be interpreted. */
+#define DS4_GPU_COMP_CACHE_FMT_F32 0u
+#define DS4_GPU_COMP_CACHE_FMT_TURBO3 1u
 typedef struct {
     uint64_t raw_kv;
     uint64_t comp_kv;
@@ -38,6 +41,10 @@ typedef struct {
     uint32_t window;
     uint32_t ratio;
     uint32_t indexed;
+    /* DS4_GPU_COMP_CACHE_FMT_*: F32 rows are head_dim floats; TURBO3 rows
+     * are packed 3-bit groups and comp_row_bytes gives the row stride. */
+    uint32_t comp_fmt;
+    uint32_t comp_row_bytes;
 } ds4_gpu_attention_decode_row;
 #endif
 

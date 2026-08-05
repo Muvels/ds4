@@ -190,7 +190,35 @@ if [ -x ./ds4 ]; then
     done
 fi
 
-# 7: --gpu-vram 40,12 layout line.
+# 7: --comp-cache parsing: bogus values are rejected by the shared parser,
+# and known values pass argument parsing (the /dev/null model then fails,
+# proving the parser was cleared).
+for i in "${!BINS[@]}"; do
+    name=${NAMES[$i]}; bin=${BINS[$i]}
+    [ -x "$bin" ] || continue
+    case "$name" in ds4|ds4-server) ;; *) continue ;; esac
+    "$bin" --comp-cache turbo2 -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       grep -q "expected fp8 or turbo3" "$LOG" &&
+       ! grep -q "unknown option" "$LOG"; then
+        ok "$name --comp-cache turbo2 rejected with format hint ($rc)"
+    else
+        fail "$name --comp-cache turbo2 was not rejected correctly"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+    "$bin" --comp-cache turbo3 -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && ! grep -q "expected fp8 or turbo3" "$LOG" &&
+       ! grep -q "unknown option" "$LOG"; then
+        ok "$name --comp-cache turbo3 passes argument parsing ($rc)"
+    else
+        fail "$name --comp-cache turbo3 did not pass argument parsing"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+done
+
+# 8: --gpu-vram 40,12 layout line.
 if [ -x ./ds4 ]; then
     ./ds4 --gpu-vram 40,12 -m /dev/null > "$LOG" 2>&1
     rc=$?

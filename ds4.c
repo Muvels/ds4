@@ -22702,12 +22702,18 @@ static bool metal_graph_encode_decode_layer_phase(
         }
 
         n_comp = g->layer_n_comp[il];
-        comp_cache = metal_graph_attn_comp_cache_for_read(g, il, n_comp);
-        if (n_comp != 0 && !comp_cache) ok = false;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
 
     if (stop_before_attn) return ok;
+    /* Resolve the attention-visible compressor cache only when this call
+     * actually runs attention.  The coalesced session-batch path stops above
+     * and consumes packed Turbo3 rows in-kernel, so the pre-attention phases
+     * must not pay the full per-session scratch dequantization. */
+    if (ok && compressed) {
+        comp_cache = metal_graph_attn_comp_cache_for_read(g, il, n_comp);
+        if (n_comp != 0 && !comp_cache) ok = false;
+    }
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
         const bool indexed_attention = n_comp != 0 && comp_selected != NULL && n_selected != 0;
@@ -56320,6 +56326,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        fprintf(stderr,
+                "ds4: turbo3 compressor cache active: %llu-byte packed rows; "
+                "single-session attention dequantizes via per-session "
+                "scratch, coalesced session-batch attention consumes packed "
+                "rows in-kernel\n",
+                (unsigned long long)((uint64_t)DS4_N_HEAD_DIM * 3u / 8u +
+                                     (uint64_t)DS4_N_HEAD_DIM / 64u));
 #endif
     }
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
@@ -62322,8 +62335,7 @@ static bool metal_graph_session_batch_attn_core_supported(
     (void)weights;
     return false;
 #else
-    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3 ||
-        !items || count < 3 || !weights ||
+    if (!items || count < 3 || !weights ||
         count > (int)DS4_GPU_ATTENTION_DECODE_BATCH_MAX ||
         DS4_N_HEAD_DIM != 512u || metal_graph_attn_comp_cache_is_f16() ||
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
@@ -62368,6 +62380,8 @@ static bool metal_graph_session_batch_attn_core_supported(
             return false;
         }
     }
+    const bool comp_cache_turbo3 =
+        g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
         if (!layer->attn_q_a || !layer->attn_sinks ||
@@ -62390,10 +62404,16 @@ static bool metal_graph_session_batch_attn_core_supported(
             !first->batch_after_attn_hc_by_tier[home]) {
             return false;
         }
+        const bool need_packed =
+            comp_cache_turbo3 && ds4_layer_compress_ratio(il) != 0u;
+        if (need_packed && !first->layer_attn_comp_cache_packed[il]) {
+            return false;
+        }
         for (int i = 1; i < count; i++) {
             ds4_gpu_graph *g = &items[i].session->graph;
             if (g->placement[il + 1u] != home ||
-                g->cuda_tp_attn != first->cuda_tp_attn) {
+                g->cuda_tp_attn != first->cuda_tp_attn ||
+                (need_packed && !g->layer_attn_comp_cache_packed[il])) {
                 return false;
             }
         }
@@ -63032,10 +63052,6 @@ static bool metal_graph_encode_attention_session_batch(
     (void)row_base;
     return false;
 #else
-    /* The current coalesced-session kernel accepts only float/F16 compressor
-     * cache pointers.  Keep scheduling correct by falling back to the ordinary
-     * per-session decode path until a packed-row descriptor ABI is added. */
-    if (g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3) return false;
     if (!items || count < 2 || !model || !layer || il >= DS4_N_LAYER ||
         count > (int)DS4_GPU_ATTENTION_DECODE_BATCH_MAX) {
         return false;
@@ -63059,6 +63075,8 @@ static bool metal_graph_encode_attention_session_batch(
 
     ds4_gpu_attention_decode_row rows[DS4_GPU_ATTENTION_DECODE_BATCH_MAX];
     memset(rows, 0, sizeof(rows));
+    const bool comp_cache_turbo3 =
+        g_ds4_comp_cache_dtype == DS4_COMP_CACHE_TURBO3;
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
         ds4_gpu_graph *g = &s->graph;
@@ -63075,14 +63093,19 @@ static bool metal_graph_encode_attention_session_batch(
                 ? DS4_N_INDEXER_TOP_K : g->layer_n_index_comp[il])
             : 0u;
         ds4_gpu_tensor *selected = indexed ? metal_graph_comp_selected(g) : NULL;
+        /* Turbo3 sessions hand the packed rows straight to the kernel; the
+         * per-session dequantized scratch is never consulted here. */
+        ds4_gpu_tensor *comp_cache = comp_cache_turbo3
+            ? g->layer_attn_comp_cache_packed[il]
+            : g->layer_attn_comp_cache[il];
         if (g->active_tier != home || !g->layer_raw_cache[il] ||
-            (n_comp != 0u && !g->layer_attn_comp_cache[il]) ||
+            (n_comp != 0u && !comp_cache) ||
             (indexed && (!selected || n_selected == 0u))) {
             return false;
         }
         rows[i].raw_kv = (uint64_t)(uintptr_t)g->layer_raw_cache[il]->ptr;
         rows[i].comp_kv = (uint64_t)(uintptr_t)(
-            n_comp ? g->layer_attn_comp_cache[il]->ptr
+            n_comp ? comp_cache->ptr
                    : g->layer_raw_cache[il]->ptr);
         rows[i].topk = selected
             ? (uint64_t)(uintptr_t)selected->ptr : 0u;
@@ -63095,6 +63118,12 @@ static bool metal_graph_encode_attention_session_batch(
         rows[i].window = indexed ? g->raw_window : 0u;
         rows[i].ratio = indexed ? ratio : 0u;
         rows[i].indexed = indexed ? 1u : 0u;
+        rows[i].comp_fmt = comp_cache_turbo3 && n_comp != 0u
+            ? DS4_GPU_COMP_CACHE_FMT_TURBO3
+            : DS4_GPU_COMP_CACHE_FMT_F32;
+        rows[i].comp_row_bytes = comp_cache_turbo3 && n_comp != 0u
+            ? (uint32_t)ds4_comp_cache_row_bytes()
+            : 0u;
     }
 
     const bool compressed = ds4_layer_compress_ratio(il) != 0u;
@@ -63105,6 +63134,17 @@ static bool metal_graph_encode_attention_session_batch(
     float attn_factor = 1.0f;
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    static bool attn_core_logged = false;
+    if (!attn_core_logged) {
+        attn_core_logged = true;
+        fprintf(stderr,
+                "ds4: coalesced session-batch attention core active: "
+                "rows=%d comp-cache=%s%s\n",
+                count,
+                ds4_comp_cache_dtype_name(g_ds4_comp_cache_dtype),
+                comp_cache_turbo3
+                    ? " (packed rows consumed in-kernel)" : "");
     }
     return ds4_gpu_attention_decode_rows_rope_tensor(
         &head_rows,

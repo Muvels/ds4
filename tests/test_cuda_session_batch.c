@@ -155,10 +155,17 @@ int main(void) {
 
     setenv("DS4_CUDA_SESSION_BATCH_MOE", "1", 1);
 
+    /* Default is the eight-GPU TP/EP oracle configuration; a single device
+     * (e.g. DS4_TEST_GPU_DEVICES=0) exercises the per-session batch
+     * fallback, which is the shape single-GPU deployments run. */
+    const char *gpu_devices = getenv("DS4_TEST_GPU_DEVICES");
+    if (!gpu_devices || !gpu_devices[0]) gpu_devices = "0,2,4,6,1,3,5,7";
+    const bool multi_gpu = strchr(gpu_devices, ',') != NULL;
+
     ds4_gpu_config gpu_cfg = {0};
     bool skip_cuda = false;
     char err[256] = {0};
-    if (parse_gpu_vram_arg("auto", "0,2,4,6,1,3,5,7",
+    if (parse_gpu_vram_arg("auto", gpu_devices,
                            &gpu_cfg, &skip_cuda, err, sizeof(err)) != 0 ||
         skip_cuda) {
         fprintf(stderr, "FAIL: GPU configuration: %s\n", err);
@@ -169,10 +176,17 @@ int main(void) {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
         .n_threads = 1,
-        .cuda_tensor_parallel = true,
+        .cuda_tensor_parallel = multi_gpu,
         .share_session_prefill_workspace = true,
         .placement_ctx_hint = (uint32_t)test_ctx,
     };
+    const char *comp_cache = getenv("DS4_TEST_COMP_CACHE");
+    if (comp_cache && comp_cache[0] &&
+        !ds4_comp_cache_dtype_from_name(comp_cache, &opt.comp_cache_dtype)) {
+        fprintf(stderr, "FAIL: unknown DS4_TEST_COMP_CACHE '%s'\n",
+                comp_cache);
+        return 1;
+    }
     ds4_engine *engine = NULL;
     if (ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) {
         fprintf(stderr, "FAIL: engine open\n");

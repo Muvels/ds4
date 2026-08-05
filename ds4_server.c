@@ -13166,6 +13166,12 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, false),
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: batched compressor cache format: %s%s",
+                   ds4_comp_cache_dtype_name(cfg.engine.comp_cache_dtype),
+                   cfg.engine.comp_cache_dtype == DS4_COMP_CACHE_TURBO3
+                       ? " (packed rows; coalesced session-batch attention reads them in-kernel)"
+                       : "");
         if (ds4_engine_has_mtp(engine)) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
@@ -17771,6 +17777,23 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     chat_msgs_free(&history);
 }
 
+static void test_comp_cache_dtype_names_round_trip(void) {
+    ds4_comp_cache_dtype dtype = DS4_COMP_CACHE_TURBO3;
+    TEST_ASSERT(ds4_comp_cache_dtype_from_name("fp8", &dtype));
+    TEST_ASSERT(dtype == DS4_COMP_CACHE_FP8);
+    TEST_ASSERT(!strcmp(ds4_comp_cache_dtype_name(dtype), "fp8"));
+    TEST_ASSERT(ds4_comp_cache_dtype_from_name("turbo3", &dtype));
+    TEST_ASSERT(dtype == DS4_COMP_CACHE_TURBO3);
+    TEST_ASSERT(!strcmp(ds4_comp_cache_dtype_name(dtype), "turbo3"));
+    dtype = DS4_COMP_CACHE_FP8;
+    TEST_ASSERT(!ds4_comp_cache_dtype_from_name("turbo2", &dtype));
+    TEST_ASSERT(!ds4_comp_cache_dtype_from_name("", &dtype));
+    TEST_ASSERT(!ds4_comp_cache_dtype_from_name(NULL, &dtype));
+    TEST_ASSERT(!ds4_comp_cache_dtype_from_name("fp8", NULL));
+    /* Rejected names must leave the caller's value untouched. */
+    TEST_ASSERT(dtype == DS4_COMP_CACHE_FP8);
+}
+
 static void test_thinking_canonical_non_thinking_mode_noop(void) {
     /* When thinking is disabled (deepseek-chat), prompt_text ends with
      * </think> not <think>.  The toolless thinking live binding is a no-op
@@ -17796,6 +17819,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_comp_cache_dtype_names_round_trip();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();

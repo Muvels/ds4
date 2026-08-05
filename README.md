@@ -292,9 +292,11 @@ and short raw KV ring are unchanged. The current backport dequantizes through a
 per-session scratch buffer before attention, so it prioritizes memory savings
 over prefill/decode speed and must be quality-tested for the intended workload.
 
-The experiment currently supports one CUDA GPU, does not support distributed
-execution or disk KV snapshots, and disables the coalesced multi-session
-attention kernel while preserving resident session scheduling. Defaults are
+The experiment currently supports one CUDA GPU and does not support
+distributed execution or disk KV snapshots. The coalesced multi-session
+attention path is packed-aware: batched decode consumes Turbo3 rows directly
+in-kernel through a packed-row descriptor ABI (no persistent FP32 compressor
+cache is rebuilt), and resident session scheduling is preserved. Defaults are
 unchanged unless the flag is present. Example:
 
 ```sh
