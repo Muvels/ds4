@@ -9622,6 +9622,11 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    /* With the disk cache off this is a no-op; do not touch inference_mu.
+     * A bare acquisition here sits outside the prefill round-robin gate and
+     * can starve for the whole duration of another slot's long prefill,
+     * serializing concurrent requests. */
+    if (!s->kv.enabled) return 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
