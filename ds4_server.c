@@ -10442,10 +10442,16 @@ static int server_session_sync(server *s, server_slot *slot,
         return rc;
     }
 
-    pthread_mutex_lock(&s->inference_mu);
+    /* Take a scheduled prefill turn for this read instead of a bare mutex
+     * acquisition.  A slot mid-prefill releases and immediately re-acquires
+     * inference_mu on a hot loop, so a plain lock here can starve behind it
+     * for minutes (lock convoy): the second long request then appears to
+     * wait until the first finishes.  Entering the round-robin gate makes
+     * the running slot yield within one quantum. */
+    if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
     int live = ds4_session_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
-    pthread_mutex_unlock(&s->inference_mu);
+    server_prefill_leave(s);
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
@@ -12241,8 +12247,21 @@ static void dispatch_jobs_locked(server *s) {
             }
         }
         pthread_mutex_unlock(&s->tool_mu);
-        (void)chosen_score;
-        if (!chosen || !chosen_slot) break;
+        if (!chosen || !chosen_slot) {
+            if (s->head) {
+                char busy[65];
+                int n = s->slot_count < 64 ? s->slot_count : 64;
+                for (int i = 0; i < n; i++) {
+                    busy[i] = s->slots[i].busy ? 'B' :
+                              s->slots[i].assigned ? 'A' : '.';
+                }
+                busy[n] = '\0';
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: job waiting: no eligible free slot (slots=%s)",
+                           busy);
+            }
+            break;
+        }
 
         if (chosen_prev) chosen_prev->next = chosen->next;
         else s->head = chosen->next;
@@ -12250,6 +12269,9 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: job dispatched slot=%d prompt=%d score=%d",
+                   chosen_slot->id, chosen->req.prompt.len, chosen_score);
         pthread_cond_broadcast(&s->cv);
     }
 }
@@ -12262,6 +12284,8 @@ static bool enqueue(server *s, job *j) {
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: job queued prompt=%d", j->req.prompt.len);
     if (s->batched_mode) {
         dispatch_jobs_locked(s);
         pthread_cond_broadcast(&s->cv);
